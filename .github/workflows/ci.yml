@@ -1,0 +1,85 @@
+# Конвейер шлюза.
+#
+# Базы у шлюза нет: он проверяет токен и маршрутизирует. Зато нужен живой
+# Keycloak — интеграционный тест пропускает себя сам, если тот недоступен,
+# и без него проверка настройки области исчезла бы незаметно.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Тесты
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Область описывает клиентов, роли и учётные записи всей системы,
+      # поэтому живёт вместе с остальными настройками инфраструктуры,
+      # а не в шлюзе. Репозиторий публичный, доступы не нужны.
+      - uses: actions/checkout@v5
+        with:
+          repository: mireacrm/deploy
+          path: deploy-config
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Keycloak
+        # Служебным контейнером его не поднять: область импортируется из
+        # каталога, а тот появляется только после выгрузки.
+        run: |
+          docker run -d --name keycloak --network host \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
+            -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+            -e KC_HOSTNAME=http://localhost:8080 \
+            -v "$PWD/deploy-config/deploy/keycloak:/opt/keycloak/data/import:ro" \
+            quay.io/keycloak/keycloak:26.0 start-dev --import-realm
+
+          for _ in $(seq 1 60); do
+            if curl -sf http://localhost:8080/realms/mirea/.well-known/openid-configuration >/dev/null; then
+              echo "область mirea импортирована"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::Keycloak не поднялся"
+          docker logs keycloak | tail -30
+          exit 1
+
+      - name: Установка
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Линтер
+        run: |
+          pip install ruff
+          ruff check .
+
+      - name: Модульные тесты
+        run: python -m pytest tests/unit -q
+
+      - name: Интеграционные тесты
+        # Тест пропускает себя при недоступном Keycloak, поэтому пропуск
+        # здесь означал бы не «нечего проверять», а незамеченную поломку.
+        run: |
+          # Шаги идут под bash -e, но без pipefail: без него падение pytest
+          # спряталось бы за успешным tee.
+          set -o pipefail
+          python -m pytest tests/integration -q | tee result.txt
+          if grep -q skipped result.txt; then
+            echo "::error::тесты Keycloak пропущены"
+            exit 1
+          fi
+
+      - name: Образ собирается
+        run: docker build -t gateway:ci .
