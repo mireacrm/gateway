@@ -63,7 +63,9 @@ jobs:
       - name: Линтер
         run: |
           pip install ruff
-          ruff check .
+          # Пути явные: рядом лежит выгруженный deploy, и обход от корня
+          # рабочего каталога зацепил бы чужие файлы.
+          ruff check app tests
 
       - name: Модульные тесты
         run: python -m pytest tests/unit -q
